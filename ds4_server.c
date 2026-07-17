@@ -12233,6 +12233,23 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+static bool header_is_chunked(const char *h, size_t n) {
+    const char *p = h, *end = h + n;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len >= 18 && strncasecmp(line, "Transfer-Encoding:", 18) == 0) {
+            for (const char *q = line + 18; q + 7 <= line + len; q++) {
+                if (strncasecmp(q, "chunked", 7) == 0) return true;
+            }
+        }
+        if (p < end) p++;
+    }
+    return false;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
@@ -12259,6 +12276,53 @@ static bool read_http_request(int fd, http_request *r) {
     if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
+
+    if (header_is_chunked(b.ptr, (size_t)hend)) {
+        /* Transfer-Encoding: chunked (e.g. Node/undici streaming a large body).
+         * Decode chunks until the terminating 0-size chunk.  The server always
+         * responds Connection: close, so trailers after it can be ignored. */
+        buf out = {0};
+        size_t pos = (size_t)hend;
+        for (;;) {
+            ssize_t nl = -1;
+            for (;;) {
+                for (size_t i = pos; i + 1 < b.len; i++) {
+                    if (b.ptr[i] == '\r' && b.ptr[i + 1] == '\n') { nl = (ssize_t)i; break; }
+                }
+                if (nl >= 0) break;
+                if (b.len - pos > 256) { buf_free(&out); goto fail; }
+                char tmp[8192];
+                ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) { buf_free(&out); goto fail; }
+                buf_append(&b, tmp, (size_t)n);
+            }
+            char *endp = NULL;
+            unsigned long csize = strtoul(b.ptr + pos, &endp, 16);
+            if (endp == b.ptr + pos) { buf_free(&out); goto fail; }
+            pos = (size_t)nl + 2;
+            if (csize == 0) break;
+            if (out.len + (size_t)csize > max_body) { buf_free(&out); goto fail; }
+            while (b.len < pos + (size_t)csize + 2) {
+                char tmp[8192];
+                ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) { buf_free(&out); goto fail; }
+                buf_append(&b, tmp, (size_t)n);
+            }
+            buf_append(&out, b.ptr + pos, (size_t)csize);
+            pos += (size_t)csize;
+            if (b.ptr[pos] != '\r' || b.ptr[pos + 1] != '\n') { buf_free(&out); goto fail; }
+            pos += 2;
+        }
+        r->body_len = out.len;
+        r->body = xmalloc(out.len + 1);
+        if (out.len) memcpy(r->body, out.ptr, out.len);
+        r->body[out.len] = '\0';
+        buf_free(&out);
+        buf_free(&b);
+        return true;
+    }
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
