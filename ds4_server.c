@@ -2441,11 +2441,20 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
     if (tool_schemas && tool_schemas[0]) {
         append_tools_prompt_text(&system, tool_schemas);
     }
-    for (int i = 0; i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (!role_is_system(m->role)) continue;
+    /* Only the leading run of system messages (the top-level system prompt)
+     * belongs in the hoisted, cached prefix.  Client-injected system messages
+     * that appear later in the conversation (deferred-tool lists, plan-mode /
+     * todo reminders) are re-emitted and their position relative to the final
+     * message varies between requests -- a message that is last in one request
+     * is mid-array in the next.  Hoisting some but not others shifts the whole
+     * prefix and defeats the cache, so render every non-leading system message
+     * inline at its own message position (below) where its placement is stable. */
+    int lead_sys_end = 0;
+    while (lead_sys_end < msgs->len && role_is_system(msgs->v[lead_sys_end].role))
+        lead_sys_end++;
+    for (int i = 0; i < lead_sys_end; i++) {
         if (system.len) buf_puts(&system, "\n\n");
-        buf_puts(&system, m->content ? m->content : "");
+        buf_puts(&system, msgs->v[i].content ? msgs->v[i].content : "");
     }
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
@@ -2462,6 +2471,17 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
+            if (i >= lead_sys_end && m->content && m->content[0]) {
+                /* Non-leading injected system message (deferred-tool list,
+                 * plan-mode / todo reminder): render inline at its position,
+                 * attached to the current turn, so its placement is stable
+                 * across requests and a change only invalidates from here on. */
+                if (!pending_assistant) buf_puts(&out, "<｜User｜>");
+                else buf_puts(&out, "\n\n");
+                buf_puts(&out, m->content);
+                pending_assistant = true;
+                pending_tool_result = false;
+            }
             continue;
         } else if (!strcmp(m->role, "user")) {
             buf_puts(&out, "<｜User｜>");
@@ -2553,17 +2573,31 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
         }
         buf_free(&tools);
     }
-    for (int i = 0; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (!role_is_system(m->role)) continue;
+    /* Only the leading run of system messages belongs in the cached prefix;
+     * render later injected system messages (deferred-tool lists, plan-mode /
+     * todo reminders) inline at their message position (below) so their
+     * placement is stable across requests and does not shift the prefix. */
+    int lead_sys_end = 0;
+    while (msgs && lead_sys_end < msgs->len &&
+           role_is_system(msgs->v[lead_sys_end].role))
+        lead_sys_end++;
+    for (int i = 0; i < lead_sys_end; i++) {
         buf_puts(&out, "<|system|>");
-        buf_puts(&out, m->content ? m->content : "");
+        buf_puts(&out, msgs->v[i].content ? msgs->v[i].content : "");
     }
 
     bool pending_assistant = false;
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
+            if (i >= lead_sys_end && m->content && m->content[0]) {
+                /* Non-leading injected system message: render inline at its
+                 * position (GLM has a native <|system|> turn marker) so the
+                 * cached prefix stays stable across requests. */
+                buf_puts(&out, "<|system|>");
+                buf_puts(&out, m->content);
+                pending_assistant = true;
+            }
             continue;
         } else if (!strcmp(m->role, "user")) {
             buf_puts(&out, "<|user|>");
@@ -3295,7 +3329,14 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         msg.role = xstrdup("system");
         msg.content = system;
         system = NULL;
+        /* Prepend at the head so the top-level system prompt anchors the stable
+         * cache prefix instead of trailing after client-injected reminders. */
         chat_msgs_push(&msgs, msg);
+        if (msgs.len > 1) {
+            chat_msg tmp = msgs.v[msgs.len - 1];
+            for (int i = msgs.len - 1; i > 0; i--) msgs.v[i] = msgs.v[i - 1];
+            msgs.v[0] = tmp;
+        }
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
